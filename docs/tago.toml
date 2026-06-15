@@ -1,0 +1,10 @@
+title       = "thegioididong"
+baseURL     = "https://thegioididong-cli.tamnd.com/"
+description = "A command line for thegioididong."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/thegioididong-cli"
