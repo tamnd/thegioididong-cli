@@ -2,125 +2,108 @@ package thegioididong
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes thegioididong as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/thegioididong-cli/thegioididong"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// thegioididong:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone thegioididong binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the thegioididong driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the TGDD kit driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "thegioididong",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "thegioididong",
-			Short:  "A command line for thegioididong.",
-			Long: `A command line for thegioididong.
+			Short:  "A command line for Thế Giới Di Động.",
+			Long: `A command line for Thế Giới Di Động (thegioididong.com).
 
-thegioididong reads public thegioididong data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+Fetches product details, category listings, and customer reviews
+from Vietnam's largest mobile and electronics retail chain.
+No API key required.`,
+			Site: "https://" + Host,
 			Repo: "https://github.com/tamnd/thegioididong-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `thegioididong page` and
-	// `ant get thegioididong://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "product", Group: "product", Single: true,
+		URIType: "product", Resolver: true, Summary: "Fetch a product by slug or URL",
+		Args: []kit.Arg{{Name: "ref", Help: "product slug or URL"}}}, getProduct)
 
-	// List op: members of a page, the home of `thegioididong links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// thegioididong://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "products", Group: "product", List: true,
+		URIType: "product", Summary: "List products from a category",
+		Args: []kit.Arg{{Name: "category", Help: "category slug (e.g. dien-thoai)"}}}, listProducts)
+
+	kit.Handle(app, kit.OpMeta{Name: "reviews", Group: "product", List: true,
+		URIType: "review", Summary: "List customer reviews for a product",
+		Args: []kit.Arg{{Name: "ref", Help: "product slug or URL"}}}, listReviews)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := NewClientWithConfig(DefaultConfig())
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		c.cfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		c.cfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		c.cfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.cfg.Timeout = cfg.Timeout
+		c.http.Timeout = cfg.Timeout
 	}
 	return c, nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type productRef struct {
+	Ref    string  `kit:"arg" help:"product slug or URL"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type productsIn struct {
+	Category string  `kit:"arg" help:"category slug (e.g. dien-thoai)"`
+	Limit    int     `kit:"flag,inherit" help:"max results"`
+	Client   *Client `kit:"inject"`
+}
+
+type reviewsIn struct {
+	Ref    string  `kit:"arg" help:"product slug or URL"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func getProduct(ctx context.Context, in productRef, emit func(*Product) error) error {
+	slug := productSlug(in.Ref)
+	if slug == "" {
+		return errs.Usage("unrecognized TGDD product reference: %q", in.Ref)
+	}
+	p, err := in.Client.GetProduct(ctx, slug)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
 	return emit(p)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func listProducts(ctx context.Context, in productsIn, emit func(*Product) error) error {
+	products, err := in.Client.ListProducts(ctx, in.Category, in.Limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
+	for _, p := range products {
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -128,46 +111,65 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full thegioididong.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized thegioididong reference: %q", input)
+func listReviews(ctx context.Context, in reviewsIn, emit func(*Review) error) error {
+	slug := productSlug(in.Ref)
+	if slug == "" {
+		return errs.Usage("unrecognized TGDD product reference: %q", in.Ref)
 	}
-	return "page", id, nil
+	base := in.Client.cfg.BaseURL
+	if base == "" {
+		base = baseURL
+	}
+	pageURL := base + "/" + slug + ".aspx"
+	body, err := in.Client.Get(ctx, pageURL)
+	if err != nil {
+		return err
+	}
+	m := dataIdRE.FindSubmatch(body)
+	if len(m) < 2 {
+		return errs.NotFound("no product ID found for %q", slug)
+	}
+	productID := string(m[1])
+	reviews, err := in.Client.ListReviews(ctx, productID, slug, in.Limit)
+	if err != nil {
+		return err
+	}
+	for _, r := range reviews {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// --- Resolver ---
+
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	slug := productSlug(input)
+	if slug != "" {
+		return "product", slug, nil
+	}
+	return "", "", errs.Usage("unrecognized TGDD reference: %q", input)
+}
+
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "product":
+		return baseURL + "/" + strings.Trim(id, "/") + ".aspx", nil
+	default:
 		return "", errs.Usage("thegioididong has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
+// productSlug extracts the slug from a URL or returns the bare slug.
+func productSlug(input string) string {
 	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+	if strings.Contains(input, "thegioididong.com") || strings.HasPrefix(input, "http") {
+		return extractSlug(input)
 	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+	slug := strings.TrimSuffix(strings.Trim(input, "/"), ".aspx")
+	if slug != "" && !strings.Contains(slug, " ") {
+		return slug
+	}
+	return ""
 }
